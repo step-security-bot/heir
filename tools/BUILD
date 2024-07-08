@@ -60,6 +60,7 @@ cc_binary(
         "@heir//lib/Dialect/Polynomial/Transforms",
         "@heir//lib/Dialect/Polynomial/Transforms:NTTRewrites",
         "@heir//lib/Dialect/RNS/IR:Dialect",
+        "@heir//lib/Dialect/Random/IR:Dialect",
         "@heir//lib/Dialect/Secret/IR:Dialect",
         "@heir//lib/Dialect/Secret/Transforms",
         "@heir//lib/Dialect/Secret/Transforms:BufferizableOpInterface",
