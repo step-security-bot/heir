@@ -2,12 +2,13 @@
 // optimization. This should optimize the multiplications instead of performing
 // a 32-bit generic multiplication.
 
-// RUN: heir-opt --yosys-optimizer="abc-fast=True" %s | FileCheck %s
+// RUN: heir-opt --yosys-optimizer="abc-fast=True" --symbol-dce %s | FileCheck %s
 
 module attributes {tf_saved_model.semantics} {
   // Use a weight vector with multiple weights to avoid constant folding.
   memref.global "private" constant @__constant_1xi8 : memref<2xi8> = dense<[3, 2]> {alignment = 64 : i64}
-  func.func @global_mul_32(%arg0 : !secret.secret<memref<1xi8>>, %weight : i8) -> (!secret.secret<memref<1xi8>>, !secret.secret<memref<1xi8>>) {
+  // CHECK-LABEL: @global_mul_32
+  func.func @global_mul_32(%arg0 : !secret.secret<memref<1xi8>>, %weight : i8) -> (!secret.secret<memref<1xi8>>) {
     // Generic 8-bit multiplication
     // CHECK: secret.generic
     // CHECK-COUNT-86: comb.truth_table
@@ -23,6 +24,11 @@ module attributes {tf_saved_model.semantics} {
       }
       secret.yield %alloc_0 : memref<1xi8>
     } -> !secret.secret<memref<1xi8>>
+    // CHECK: return
+    return %0 : !secret.secret<memref<1xi8>>
+  }
+  // CHECK-LABEL: @global_mul_32_constants
+  func.func @global_mul_32_constants(%arg0 : !secret.secret<memref<1xi8>>, %weight : i8) -> (!secret.secret<memref<1xi8>>) {
     // 8-bit multiplication with constant weights
     // CHECK: secret.generic
     // CHECK-COUNT-28: comb.truth_table
@@ -41,6 +47,6 @@ module attributes {tf_saved_model.semantics} {
       secret.yield %alloc_0 : memref<1xi8>
     } -> !secret.secret<memref<1xi8>>
     // CHECK: return
-    return %0, %5 : !secret.secret<memref<1xi8>>, !secret.secret<memref<1xi8>>
+    return %5 : !secret.secret<memref<1xi8>>
   }
 }

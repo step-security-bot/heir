@@ -472,6 +472,19 @@ class SecretGenericOpMemRefDeallocConversion
   }
 };
 
+class SecretGenericOpMemRefCollapseShapeConversion
+    : public SecretGenericOpConversion<memref::CollapseShapeOp> {
+  using SecretGenericOpConversion<
+      memref::CollapseShapeOp>::SecretGenericOpConversion;
+
+  void replaceOp(secret::GenericOp op, TypeRange outputTypes, ValueRange inputs,
+                 ArrayRef<NamedAttribute> attributes,
+                 ConversionPatternRewriter &rewriter) const override {
+    rewriter.replaceOpWithNewOp<memref::CollapseShapeOp>(op, outputTypes,
+                                                         inputs, attributes);
+  }
+};
+
 // ConvertTruthTableOp converts truth table ops with fully plaintext values.
 struct ConvertTruthTableOp : public OpConversionPattern<TruthTableOp> {
   ConvertTruthTableOp(mlir::MLIRContext *context)
@@ -630,6 +643,7 @@ struct CombToCGGI : public impl::CombToCGGIBase<CombToCGGI> {
     patterns
         .add<SecretGenericOpLUTConversion, SecretGenericOpMemRefAllocConversion,
              SecretGenericOpMemRefDeallocConversion,
+             SecretGenericOpMemRefCollapseShapeConversion,
              SecretGenericOpMemRefLoadConversion,
              SecretGenericOpAffineStoreConversion,
              SecretGenericOpAffineLoadConversion,

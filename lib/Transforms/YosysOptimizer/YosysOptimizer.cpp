@@ -20,6 +20,7 @@
 #include "lib/Transforms/YosysOptimizer/BooleanGateImporter.h"
 #include "lib/Transforms/YosysOptimizer/LUTImporter.h"
 #include "lib/Transforms/YosysOptimizer/RTLILImporter.h"
+#include "llvm/include/llvm/ADT/STLExtras.h"           // from @llvm-project
 #include "llvm/include/llvm/ADT/SmallVector.h"         // from @llvm-project
 #include "llvm/include/llvm/ADT/Statistic.h"           // from @llvm-project
 #include "llvm/include/llvm/Support/Debug.h"           // from @llvm-project
@@ -78,6 +79,7 @@ read_verilog -sv {0};
 hierarchy -check -top \{1};
 proc; memory; stat;
 techmap -map {2}/techmap.v; stat;
+opt_expr; opt_clean -purge; stat;
 splitnets -ports \{1} %n;
 flatten; opt_expr; opt; opt_clean -purge;
 rename -hide */w:*; rename -enumerate */w:*;
@@ -95,13 +97,16 @@ stat;
 // $3: yosys runfiles path
 // $4: abc fast option -fast
 constexpr std::string_view kYosysBooleanTemplate = R"(
-read_verilog {0};
+read_verilog -sv {0};
 hierarchy -check -top \{1};
 proc; memory; stat;
-techmap -map {3}/techmap.v; opt; stat;
+techmap -map {3}/techmap.v; stat;
+opt_expr; opt_clean -purge; stat;
+splitnets -ports \{1} %n;
+flatten; opt_expr; opt; opt_clean -purge;
+rename -hide */w:*; rename -enumerate */w:*;
 abc -exe {2} -g AND,NAND,OR,NOR,XOR,XNOR {4};
 opt_clean -purge; stat;
-rename -hide */c:*; rename -enumerate */c:*;
 hierarchy -generate * o:Y i:*; opt; opt_clean -purge;
 clean;
 stat;
@@ -141,12 +146,14 @@ struct YosysOptimizer : public impl::YosysOptimizerBase<YosysOptimizer> {
   using YosysOptimizerBase::YosysOptimizerBase;
 
   YosysOptimizer(std::string yosysFilesPath, std::string abcPath, bool abcFast,
-                 int unrollFactor, Mode mode, bool printStats)
+                 int unrollFactor, bool useSubmodules, Mode mode,
+                 bool printStats)
       : yosysFilesPath(std::move(yosysFilesPath)),
         abcPath(std::move(abcPath)),
         abcFast(abcFast),
         printStats(printStats),
         unrollFactor(unrollFactor),
+        useSubmodules(useSubmodules),
         mode(mode) {}
 
   void runOnOperation() override;
@@ -162,6 +169,7 @@ struct YosysOptimizer : public impl::YosysOptimizerBase<YosysOptimizer> {
   bool abcFast;
   bool printStats;
   int unrollFactor;
+  bool useSubmodules;
   Mode mode;
   llvm::SmallVector<RelativeOptimizationStatistics> optStatistics;
 };
@@ -202,6 +210,12 @@ LogicalResult convertOpOperands(secret::GenericOp op, func::FuncOp func,
         func.getFunctionType().getInputs()[opOperand.getOperandNumber()];
 
     if (!mlir::isa<secret::SecretType>(opOperand.get().getType())) {
+      if (!mlir::isa<IntegerType>(opOperand.get().getType())) {
+        op.emitError() << "While booleanizing secret.generic, found converted "
+                          "type that cannot be reassembled: "
+                       << opOperand.get().getType();
+        return failure();
+      }
       // The type is not secret, but still must be booleanized
       OpBuilder builder(op);
       auto convertedValue = convertIntegerValue(opOperand.get(), convertedType,
@@ -446,6 +460,7 @@ LogicalResult YosysOptimizer::runOnGenericOp(secret::GenericOp op) {
 
   // Translate Yosys result back to MLIR and insert into the func
   LLVM_DEBUG(Yosys::run_pass("dump;"));
+  Yosys::log_streams.clear();
   std::stringstream cellOrder;
   Yosys::log_streams.push_back(&cellOrder);
   Yosys::run_pass("torder -stop * P*;");
@@ -465,8 +480,11 @@ LogicalResult YosysOptimizer::runOnGenericOp(secret::GenericOp op) {
   } else {
     importer = std::make_unique<BooleanGateImporter>(context);
   }
-  func::FuncOp func =
-      importer->importModule(design->top_module(), topologicalOrder);
+  func::FuncOp func = importer->importModule(
+      design->top_module(), topologicalOrder,
+      llvm::to_vector(llvm::map_range(op.getResultTypes(), [](Type ty) {
+        return cast<secret::SecretType>(ty).getValueType();
+      })));
   Yosys::run_pass("delete;");
 
   LLVM_DEBUG(llvm::dbgs() << "Done importing RTLIL, now type-coverting ops\n");
@@ -532,30 +550,36 @@ void YosysOptimizer::runOnOperation() {
   auto *ctx = &getContext();
   auto *op = getOperation();
 
-  if (unrollFactor > 1 && failed(unrollAndMergeGenerics(
-                              op, unrollFactor, getAnalysis<DominanceInfo>(),
-                              getAnalysis<PostDominanceInfo>()))) {
-    signalPassFailure();
-    return;
+  // Absorb any memref deallocs into generic's that allocate and use the memref.
+  mlir::IRRewriter builder(&getContext());
+  op->walk([&](secret::GenericOp op) { genericAbsorbDealloc(op, builder); });
+
+  mlir::RewritePatternSet cleanupPatterns(ctx);
+  if (unrollFactor > 1) {
+    if (failed(unrollAndMergeGenerics(op, unrollFactor,
+                                      getAnalysis<DominanceInfo>(),
+                                      getAnalysis<PostDominanceInfo>()))) {
+      signalPassFailure();
+      return;
+    }
+
+    // Cleanup after unrollAndMergeGenerics
+    // We lift loads/stores into their own generics if possible, to avoid
+    // putting the entire memref in the verilog module. Some loads would be
+    // hoistable but they depend on arithmetic of index accessors that are
+    // otherwise secret. Hence we need the HoistPlaintextOps provided by
+    // populateGenericCanonicalizers in addition to special patterns that lift
+    // loads and stores into their own generics.
+    cleanupPatterns.add<secret::HoistOpBeforeGeneric>(
+        ctx, std::vector<std::string>{"memref.load", "affine.load"});
+    cleanupPatterns.add<secret::HoistOpAfterGeneric>(
+        ctx, std::vector<std::string>{"memref.store", "affine.store"});
   }
 
-  // Cleanup after unrollAndMergeGenerics
-  mlir::RewritePatternSet cleanupPatterns(ctx);
-  // We lift loads/stores into their own generics if possible, to avoid putting
-  // the entire memref in the verilog module. Some loads would be hoistable but
-  // they depend on arithmetic of index accessors that are otherwise secret.
-  // Hence we need the HoistPlaintextOps provided by
-  // populateGenericCanonicalizers in addition to special patterns that lift
-  // loads and stores into their own generics.
-  cleanupPatterns.add<secret::HoistOpBeforeGeneric>(
-      ctx, std::vector<std::string>{"memref.load", "affine.load"});
-  cleanupPatterns.add<secret::HoistOpAfterGeneric>(
-      ctx, std::vector<std::string>{"memref.store", "affine.store"});
   secret::populateGenericCanonicalizers(cleanupPatterns, ctx);
   if (failed(applyPatternsAndFoldGreedily(op, std::move(cleanupPatterns)))) {
     signalPassFailure();
-    getOperation()->emitError()
-        << "Failed to cleanup generic ops after unrollAndMergeGenerics";
+    getOperation()->emitError() << "Failed to cleanup generic ops";
     return;
   }
 
@@ -572,16 +596,50 @@ void YosysOptimizer::runOnOperation() {
     return;
   }
 
+  // Extract generics body's into function calls.
+  if (useSubmodules) {
+    auto result = op->walk([&](secret::GenericOp op) {
+      genericAbsorbConstants(op, builder);
+
+      auto isTrivial = op.getBody()->walk([&](Operation *body) {
+        if (isa<arith::ArithDialect>(body->getDialect()) &&
+            !isa<arith::ConstantOp>(body)) {
+          return WalkResult::interrupt();
+        }
+        return WalkResult::advance();
+      });
+      if (isTrivial.wasInterrupted()) {
+        if (failed(extractGenericBody(op, builder))) {
+          return WalkResult::interrupt();
+        }
+      }
+
+      return WalkResult::advance();
+    });
+
+    if (result.wasInterrupted()) {
+      signalPassFailure();
+    }
+
+    // Merge generics after the function bodies are extracted.
+    mlir::RewritePatternSet mergePatterns(ctx);
+    mergePatterns.add<secret::MergeAdjacentGenerics>(ctx);
+    if (failed(applyPatternsAndFoldGreedily(op, std::move(mergePatterns)))) {
+      signalPassFailure();
+      getOperation()->emitError()
+          << "Failed to merge generic ops before yosys optimizer";
+      return;
+    }
+  }
+
   LLVM_DEBUG({
     llvm::dbgs() << "IR after cleanup in preparation for yosys optimizer\n";
     getOperation()->dump();
   });
 
-  mlir::IRRewriter builder(&getContext());
   auto result = op->walk([&](secret::GenericOp op) {
     // Now pass through any constants used after capturing the ambient scope.
-    // This
-    // way Yosys can optimize constants away instead of treating them as
+    // This way Yosys can optimize constants away instead of treating them as
     // variables to the optimized body.
     genericAbsorbConstants(op, builder);
 
@@ -610,9 +668,10 @@ void YosysOptimizer::runOnOperation() {
 
 std::unique_ptr<mlir::Pass> createYosysOptimizer(
     const std::string &yosysFilesPath, const std::string &abcPath, bool abcFast,
-    int unrollFactor, Mode mode, bool printStats) {
+    int unrollFactor, bool useSubmodules, Mode mode, bool printStats) {
   return std::make_unique<YosysOptimizer>(yosysFilesPath, abcPath, abcFast,
-                                          unrollFactor, mode, printStats);
+                                          unrollFactor, useSubmodules, mode,
+                                          printStats);
 }
 
 void registerYosysOptimizerPipeline(const std::string &yosysFilesPath,
@@ -621,9 +680,9 @@ void registerYosysOptimizerPipeline(const std::string &yosysFilesPath,
       "yosys-optimizer", "The yosys optimizer pipeline.",
       [yosysFilesPath, abcPath](OpPassManager &pm,
                                 const YosysOptimizerPipelineOptions &options) {
-        pm.addPass(createYosysOptimizer(yosysFilesPath, abcPath,
-                                        options.abcFast, options.unrollFactor,
-                                        options.mode, options.printStats));
+        pm.addPass(createYosysOptimizer(
+            yosysFilesPath, abcPath, options.abcFast, options.unrollFactor,
+            options.useSubmodules, options.mode, options.printStats));
         pm.addPass(mlir::createCSEPass());
       });
 }
